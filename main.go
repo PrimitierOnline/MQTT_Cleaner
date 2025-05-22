@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -219,38 +220,65 @@ func main() {
 	client.Subscribe(baseFilter, cfg.QoS, handler)
 	client.Subscribe(subFilter, cfg.QoS, handler)
 	fmt.Println("Collecting retained topics (waiting 5s)...")
-	time.Sleep(5 * time.Second) // 待機時間を延長
+	time.Sleep(5 * time.Second)
 	client.Unsubscribe(baseFilter, subFilter)
 
-	// 削除処理の実行
+	// 並列処理用の設定
+	const maxWorkers = 100 // 同時実行するワーカー数
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	cleared := make(map[string]bool)
+	topics := make([]string, 0, len(found))
 	for topic := range found {
+		topics = append(topics, topic)
+	}
+
+	// ワーカー関数
+	worker := func(topic string) {
+		defer wg.Done()
 		// 最大3回まで再試行
 		for retry := 0; retry < 3; retry++ {
 			tok := client.Publish(topic, cfg.QoS, true, "")
 			tok.Wait()
 			if err := tok.Error(); err != nil {
 				fmt.Printf("Error clearing %s (attempt %d): %v\n", topic, retry+1, err)
-				time.Sleep(time.Second) // 再試行前に待機
+				time.Sleep(time.Second)
 				continue
 			}
+			mu.Lock()
 			cleared[topic] = true
+			mu.Unlock()
 			fmt.Println("Cleared retained message on topic:", topic)
 			break
 		}
 	}
 
+	// 並列処理の実行
+	fmt.Printf("Starting parallel deletion with %d workers...\n", maxWorkers)
+	for i := 0; i < len(topics); i += maxWorkers {
+		end := i + maxWorkers
+		if end > len(topics) {
+			end = len(topics)
+		}
+		batch := topics[i:end]
+		for _, topic := range batch {
+			wg.Add(1)
+			go worker(topic)
+		}
+		wg.Wait()
+	}
+
 	// 削除の検証
 	verifyHandler := func(_ mqtt.Client, msg mqtt.Message) {
 		if msg.Retained() {
+			mu.Lock()
 			cleared[msg.Topic()] = false
+			mu.Unlock()
 		}
 	}
 
 	// 検証用のサブスクリプション
-	topics := make([]string, 0, len(found))
-	for topic := range found {
-		topics = append(topics, topic)
+	for _, topic := range topics {
 		client.Subscribe(topic, cfg.QoS, verifyHandler)
 	}
 	time.Sleep(2 * time.Second)
